@@ -1,0 +1,534 @@
+# =============================================================================
+# Home server stack for Ubuntu Server
+#
+# Secrets and machine-specific values live in .env (see .env.example).
+#
+# Core stack (always on):  adguard, jellyfin, qbittorrent, portainer,
+#                          nginx-proxy-manager, duckdns
+# Optional (profiles):     rss              -> freshrss
+#                          arr              -> prowlarr, sonarr, radarr
+#                          jellyseerr       -> seerr (media requests for Jellyfin)
+#                          photos           -> immich (NO machine learning)
+#                          vpn              -> wg-easy (WireGuard)
+#                          files            -> filebrowser
+#                          minecraft        -> crafty
+#                          monitoring       -> Beszel
+#                          monitoring-agent -> Beszel agent
+#
+# Start core only:         docker compose up -d
+# Make extras permanent:   set COMPOSE_PROFILES=rss,arr,jellyseerr,... in .env
+#
+# NETWORK: NETWORK_EXTERNAL in .env decides how media-stack-network is handled
+#   true  = "current": the network already exists, compose just uses it
+#   false = "new":     compose creates it (and `docker compose down` removes it)
+#
+# EXPOSED TO THE INTERNET (router forwards only what you actually use):
+#   80/tcp, 443/tcp   -> Nginx Proxy Manager (the only web entry point)
+#   51820/udp         -> WireGuard (if you enable the vpn profile)
+# EVERYTHING ELSE is bound to ${LAN_IP} only. Keep the router DMZ DISABLED.
+#
+# NOTE: Docker-published ports BYPASS UFW. Binding to ${LAN_IP} and choosing
+# router port forwards carefully is what keeps services private.
+# =============================================================================
+
+x-common: &common
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+
+  # ===========================================================================
+  # OPTIONAL: Dashboard  (profile: dashboard)
+  # Homarr start page. No docker.sock mount on purpose (only needed for Docker
+  # container controls, and Portainer already covers that).
+  # SECRET_ENCRYPTION_KEY must stay the same forever or saved integrations break:
+  #   generate once with:  openssl rand -hex 32
+  # Open http://LAN_IP:7575, create the admin account, add services using their
+  # CONTAINER NAMES for widgets (http://sonarr:8989, http://radarr:7878 ...) and
+  # ===========================================================================
+
+  homarr:
+    <<: *common
+    profiles: ["dashboard"]
+    image: ghcr.io/homarr-labs/homarr:latest
+    container_name: homarr
+    mem_limit: 1g
+    environment:
+      - TZ=${TZ}
+      - SECRET_ENCRYPTION_KEY=${HOMARR_KEY:?set HOMARR_KEY in .env (openssl rand -hex 32)}
+    ports:
+      - "${LAN_IP}:7575:7575"
+    volumes:
+      - ${DOCKER_DIR}/homarr/appdata:/appdata
+    networks:
+      - media-stack-network
+
+  # ===========================================================================
+  # OPTIONAL: Monitoring  (profile: monitoring)
+  # Beszel = hub (web UI) + agent (collects host and container stats).
+  # The agent talks to the hub through a unix socket in a shared folder, so no
+  # TCP port is opened and UFW is not involved.
+  #
+  # TWO-STEP FIRST START (the agent needs a key and token the hub creates):
+  #   1. docker compose --profile monitoring up -d beszel
+  #   2. Open http://LAN_IP:8091, create the admin account, click "Add system",
+  #      name it, and as host/IP enter:  /beszel_socket/beszel.sock
+  #      Copy the KEY and TOKEN it shows into .env as BESZEL_KEY / BESZEL_TOKEN.
+  #   3. docker compose --profile monitoring up -d
+  # The compose snippet the hub shows is authoritative for your version: if its
+  # variable names differ from the ones below, follow the hub.
+  # Measure it:  docker stats --no-stream beszel beszel-agent
+  # Remove it:   docker compose rm -sf beszel beszel-agent (delete ${DOCKER_DIR}/beszel)
+  # ===========================================================================
+
+  beszel:
+    <<: *common
+    profiles: ["monitoring"]
+    image: henrygd/beszel:latest
+    container_name: beszel
+    mem_limit: 256m
+    ports:
+      - "${LAN_IP}:8091:8090"       # 8090 is already AdGuard's web UI
+    volumes:
+      - ${DOCKER_DIR}/beszel/data:/beszel_data
+      - ${DOCKER_DIR}/beszel/socket:/beszel_socket
+    networks:
+      - media-stack-network
+ 
+  beszel-agent:
+    <<: *common
+    profiles: ["monitoring-agent"]
+    image: henrygd/beszel-agent:latest
+    container_name: beszel-agent
+    mem_limit: 128m
+    network_mode: host              # real host network stats; opens no port (socket mode)
+    volumes:
+      - ${DOCKER_DIR}/beszel/agent:/var/lib/beszel-agent
+      - ${DOCKER_DIR}/beszel/socket:/beszel_socket
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      - LISTEN=/beszel_socket/beszel.sock
+      - HUB_URL=http://${LAN_IP}:8091
+      # Empty until you copy them from the hub (step 2 above)
+      - KEY=${BESZEL_KEY:-}
+      - TOKEN=${BESZEL_TOKEN:-}
+
+  # ---------------------------------------------------------------------------
+  # AdGuard Home - network-wide DNS ad blocker (LAN ONLY)
+  # Settings -> DNS settings -> Access settings -> Allowed clients must list
+  # your LAN / VPN subnets so it can never act as an open resolver.
+  # ---------------------------------------------------------------------------
+  adguard:
+    <<: *common
+    image: adguard/adguardhome:latest
+    container_name: adguard
+    mem_limit: 1g
+    environment:
+      - TZ=${TZ}
+    ports:
+      # Bound to the LAN IP so it doesn't clash with systemd-resolved (127.0.0.53:53)
+      - "${LAN_IP:?set LAN_IP in .env}:53:53/tcp"
+      - "${LAN_IP}:53:53/udp"
+      - "${LAN_IP}:8090:80/tcp"     # web UI
+#      - "${LAN_IP}:3000:3000/tcp"   # first-run wizard only
+    volumes:
+      - ${DOCKER_DIR}/adguard/work:/opt/adguardhome/work
+      - ${DOCKER_DIR}/adguard/conf:/opt/adguardhome/conf
+    networks:
+      - media-stack-network
+
+  # ---------------------------------------------------------------------------
+  # Jellyfin - media server (LAN direct, internet via NPM proxy host or VPN)
+  # Hardware transcoding: Ryzen 4650G iGPU via VAAPI (/dev/dri/renderD128).
+  # ---------------------------------------------------------------------------
+  jellyfin:
+    <<: *common
+    image: jellyfin/jellyfin:latest
+    container_name: jellyfin
+    user: "${PUID}:${PGID}"
+    group_add:
+      - "${RENDER_GID}"
+      - "${VIDEO_GID}"
+    mem_limit: 3g
+    environment:
+      - TZ=${TZ}
+    ports:
+      - "${LAN_IP}:8096:8096"
+    devices:
+      - /dev/dri/renderD128:/dev/dri/renderD128
+    volumes:
+      - ${DOCKER_DIR}/jellyfin/config:/config
+      - ${DOCKER_DIR}/jellyfin/cache:/cache
+      - ${MEDIA_DIR}/Downloads/tv:/data/tvshows
+      - ${MEDIA_DIR}/Downloads/movies:/data/movies
+      - ${MEDIA_DIR}/Downloads/music:/data/music
+    networks:
+      - media-stack-network
+
+  # ---------------------------------------------------------------------------
+  # qBittorrent (LAN ONLY web UI)
+  # ---------------------------------------------------------------------------
+  qbittorrent:
+    <<: *common
+    image: lscr.io/linuxserver/qbittorrent:latest
+    container_name: qbittorrent
+    mem_limit: 1g
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - WEBUI_PORT=8080
+    ports:
+      - "${LAN_IP}:8080:8080"
+      - "6881:6881"
+      - "6881:6881/udp"
+    volumes:
+      - ${DOCKER_DIR}/qbittorrent/config:/config
+      - ${MEDIA_DIR}/Downloads:/downloads
+    networks:
+      - media-stack-network
+
+  # ---------------------------------------------------------------------------
+  # Portainer (LAN ONLY) - the docker.sock mount = root on the host.
+  # ---------------------------------------------------------------------------
+  portainer:
+    <<: *common
+    image: portainer/portainer-ce:lts
+    container_name: portainer
+    mem_limit: 256m
+    ports:
+      - "${LAN_IP}:9443:9443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${DOCKER_DIR}/portainer/data:/data
+    networks:
+      - media-stack-network
+
+  # ---------------------------------------------------------------------------
+  # Nginx Proxy Manager - the ONLY public web entry point (80/443)
+  # ---------------------------------------------------------------------------
+  nginx-proxy-manager:
+    <<: *common
+    image: jc21/nginx-proxy-manager:latest
+    container_name: nginx-proxy-manager
+    mem_limit: 512m
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "${LAN_IP}:81:81"
+    volumes:
+      - ${DOCKER_DIR}/nginx-proxy-manager/data:/data
+      - ${DOCKER_DIR}/nginx-proxy-manager/letsencrypt:/etc/letsencrypt
+    networks:
+      - media-stack-network
+
+  # ---------------------------------------------------------------------------
+  # DuckDNS - keeps your dynamic public IP updated
+  # ---------------------------------------------------------------------------
+  duckdns:
+    <<: *common
+    image: lscr.io/linuxserver/duckdns:latest
+    container_name: duckdns
+    mem_limit: 64m
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - SUBDOMAINS=${DUCKDNS_SUBDOMAIN:?set DUCKDNS_SUBDOMAIN in .env}
+      - TOKEN=${DUCKDNS_TOKEN:?set DUCKDNS_TOKEN in .env}
+      - UPDATE_IP=ipv4
+      - LOG_FILE=false
+    volumes:
+      - ${DOCKER_DIR}/duckdns/config:/config
+    networks:
+      - media-stack-network
+
+  # ===========================================================================
+  # OPTIONAL: RSS  (profile: rss)
+  # ===========================================================================
+
+  # CommaFeed - feed reader (replaces FreshRSS). LAN/VPN only.
+  # First login: admin / admin -> change it immediately.
+  commafeed:
+    <<: *common
+    profiles: ["rss"]
+    image: athou/commafeed:latest-h2
+    container_name: commafeed
+    mem_limit: 384m
+    environment:
+      - TZ=${TZ}
+      - QUARKUS_HTTP_AUTH_SESSION_ENCRYPTION_KEY=${COMMAFEED_KEY:?set COMMAFEED_KEY in .env}
+      # Needed so it may fetch http://fullrss/... (a local Docker address).
+      # This turns the protection off for ALL local addresses: keep it LAN/VPN only.
+      - COMMAFEED_HTTP_CLIENT_BLOCK_LOCAL_ADDRESSES=false
+    ports:
+      - "${LAN_IP}:8083:8082"
+    volumes:
+      - ${DOCKER_DIR}/commafeed/data:/commafeed/data
+    networks:
+      - media-stack-network
+ 
+  # FiveFilters Full-Text RSS (fullrss) - turns truncated feeds into full-text.
+  # INTERNAL ONLY, no ports published. CommaFeed reaches it at http://fullrss/
+  # Example feed URL to subscribe to in CommaFeed:
+  #   http://fullrss/makefulltextfeed.php?url=https%3A%2F%2Fexample.com%2Ffeed%2F&max=10&links=preserve
+  fullrss:
+    <<: *common
+    profiles: ["rss"]
+    image: heussd/fivefilters-full-text-rss:latest
+    container_name: fullrss
+    mem_limit: 256m
+    environment:
+      - TZ=${TZ}
+    ports:
+      - "${LAN_IP}:8084:80"
+    networks:
+      - media-stack-network
+  
+  # ===========================================================================
+  # OPTIONAL: Arr stack  (profile: arr)
+  # All of them share ${MEDIA_DIR}/Downloads mounted at /downloads, exactly
+  # like qBittorrent, so no remote path mapping is needed and imports can use
+  # hardlinks (no duplicate files, no extra disk use).
+  # Root folders to set inside the apps:
+  #   Sonarr -> /downloads/tv   Radarr -> /downloads/movies   Lidarr -> /downloads/music
+  # qBittorrent download client: host "qbittorrent", port 8080.
+  # FIRST THING in each app: Settings -> General -> Authentication -> Forms,
+  # "Required" for all connections. Never publish these to the internet.
+  # ===========================================================================
+
+  prowlarr:
+    <<: *common
+    profiles: ["arr"]
+    image: lscr.io/linuxserver/prowlarr:latest
+    container_name: prowlarr
+    mem_limit: 256m
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    ports:
+      - "${LAN_IP}:9696:9696"
+    volumes:
+      - ${DOCKER_DIR}/prowlarr/config:/config
+    networks:
+      - media-stack-network
+
+  sonarr:
+    <<: *common
+    profiles: ["arr"]
+    image: lscr.io/linuxserver/sonarr:latest
+    container_name: sonarr
+    mem_limit: 512m
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    ports:
+      - "${LAN_IP}:8989:8989"
+    volumes:
+      - ${DOCKER_DIR}/sonarr/config:/config
+      - ${MEDIA_DIR}/Downloads:/downloads
+    networks:
+      - media-stack-network
+
+  radarr:
+    <<: *common
+    profiles: ["arr"]
+    image: lscr.io/linuxserver/radarr:latest
+    container_name: radarr
+    mem_limit: 512m
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    ports:
+      - "${LAN_IP}:7878:7878"
+    volumes:
+      - ${DOCKER_DIR}/radarr/config:/config
+      - ${MEDIA_DIR}/Downloads:/downloads
+    networks:
+      - media-stack-network
+
+  # ===========================================================================
+  # OPTIONAL: Media requests  (profile: jellyseerr)
+  # Jellyseerr and Overseerr were discontinued and merged into Seerr, so this
+  # uses the official Seerr image (it migrates old Jellyseerr data on first
+  # start). In its setup choose Jellyfin and use http://jellyfin:8096 as the
+  # server; Sonarr/Radarr (if enabled) are reachable as http://sonarr:8989 and
+  # http://radarr:7878. LAN/VPN only.
+  # ===========================================================================
+  seerr:
+    <<: *common
+    profiles: ["jellyseerr"]
+    image: ghcr.io/seerr-team/seerr:latest
+    container_name: seerr
+    init: true
+    mem_limit: 512m
+    environment:
+      - TZ=${TZ}
+      - LOG_LEVEL=info
+    ports:
+      - "${LAN_IP}:5055:5055"
+    volumes:
+      - ${DOCKER_DIR}/seerr/config:/app/config      # must be owned by UID 1000
+    networks:
+      - media-stack-network
+
+  # ===========================================================================
+  # OPTIONAL: Photos  (profile: photos)
+  # Immich WITHOUT machine learning: no immich-machine-learning container,
+  # no face recognition, no smart (CLIP) search, no object tagging.
+  # Also in the web UI: Administration -> Settings -> Machine Learning Settings
+  # -> untick "Enable machine learning" and save.
+  # LAN/VPN only. For phone backup away from home, connect WireGuard first.
+  # ===========================================================================
+  immich-server:
+    <<: *common
+    profiles: ["photos"]
+    image: ghcr.io/immich-app/immich-server:${IMMICH_VERSION:-release}
+    container_name: immich_server
+    mem_limit: 2g
+    depends_on:
+      - immich-db
+      - immich-redis
+    environment:
+      - TZ=${TZ}
+      - DB_HOSTNAME=immich_postgres
+      - DB_USERNAME=postgres
+      - DB_PASSWORD=${IMMICH_DB_PASSWORD:?set IMMICH_DB_PASSWORD in .env}
+      - DB_DATABASE_NAME=immich
+      - REDIS_HOSTNAME=immich_redis
+      - IMMICH_MACHINE_LEARNING_ENABLED=false
+    ports:
+      - "${LAN_IP}:2283:2283"
+    volumes:
+      - ${IMMICH_UPLOAD_DIR:?set IMMICH_UPLOAD_DIR in .env}:/data
+      - /etc/localtime:/etc/localtime:ro
+    networks:
+      - media-stack-network
+
+  immich-redis:
+    <<: *common
+    profiles: ["photos"]
+    image: docker.io/valkey/valkey:9
+    container_name: immich_redis
+    mem_limit: 256m
+    healthcheck:
+      test: redis-cli ping || exit 1
+    networks:
+      - media-stack-network
+
+  # Postgres with the vector extensions Immich requires (keep this exact image
+  # family; check Immich's release docker-compose.yml before upgrading).
+  # The database must live on a local disk, not a network share.
+  immich-db:
+    <<: *common
+    profiles: ["photos"]
+    image: ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0
+    container_name: immich_postgres
+    mem_limit: 1g
+    shm_size: 128mb
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=${IMMICH_DB_PASSWORD}
+      - POSTGRES_DB=immich
+      - POSTGRES_INITDB_ARGS=--data-checksums
+      # - DB_STORAGE_TYPE=HDD   # uncomment if the database is NOT on an SSD
+    volumes:
+      - ${DOCKER_DIR}/immich/postgres:/var/lib/postgresql/data
+    networks:
+      - media-stack-network
+
+  # ===========================================================================
+  # OPTIONAL: VPN  (profile: vpn)
+  # ===========================================================================
+
+  # WireGuard via wg-easy v15. Only the UDP tunnel port is public; the web UI
+  # is LAN-only. Forward 51820/udp on the router to this server.
+  wg-easy:
+    <<: *common
+    profiles: ["vpn"]
+    image: ghcr.io/wg-easy/wg-easy:15
+    container_name: wg-easy
+    mem_limit: 128m
+    environment:
+      - TZ=${TZ}
+      - INSECURE=true     # allow the web UI over plain HTTP on the LAN
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv4.conf.all.src_valid_mark=1
+    ports:
+      - "51820:51820/udp"
+      - "${LAN_IP}:51821:51821/tcp"
+    volumes:
+      - ${DOCKER_DIR}/wg-easy/config:/etc/wireguard
+      - /lib/modules:/lib/modules:ro
+    networks:
+      - media-stack-network
+
+  # ===========================================================================
+  # OPTIONAL: Files  (profile: files)
+  # ===========================================================================
+
+  # File Browser - web file manager over your downloads folder (read/write!).
+  # LAN/VPN only.
+  filebrowser:
+    <<: *common
+    profiles: ["files"]
+    image: filebrowser/filebrowser:latest
+    container_name: filebrowser
+    user: "${PUID}:${PGID}"
+    mem_limit: 256m
+    ports:
+      - "${LAN_IP}:12345:80"
+    volumes:
+      - ${MEDIA_DIR}/Downloads:/srv
+      - ${DOCKER_DIR}/filebrowser/database:/database
+      - ${DOCKER_DIR}/filebrowser/config:/config
+    environment:
+      - FB_DATABASE=/database/filebrowser.db
+    networks:
+      - media-stack-network
+
+  # ===========================================================================
+  # OPTIONAL: Minecraft  (profile "minecraft")
+  # ===========================================================================
+  crafty:
+    <<: *common
+    profiles: ["minecraft"]
+    image: registry.gitlab.com/crafty-controller/crafty-4:latest
+    container_name: crafty
+    mem_limit: 4g
+    environment:
+      - TZ=${TZ}
+    ports:
+      - "${LAN_IP}:8443:8443"
+      - "25565-25570:25565-25570"
+      - "19132:19132/udp"
+    volumes:
+      - ${DOCKER_DIR}/crafty/backups:/crafty/backups
+      - ${DOCKER_DIR}/crafty/logs:/crafty/logs
+      - ${DOCKER_DIR}/crafty/servers:/crafty/servers
+      - ${DOCKER_DIR}/crafty/config:/crafty/app/config
+      - ${DOCKER_DIR}/crafty/import:/crafty/import
+    networks:
+      - media-stack-network
+
+networks:
+  media-stack-network:
+    name: media-stack-network
+    # true  = "current": use the existing network
+    # false = "new":     let compose create it (only if it does not exist yet)
+    external: ${NETWORK_EXTERNAL:-true}
